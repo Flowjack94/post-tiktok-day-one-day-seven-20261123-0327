@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sand Magnet Totem — Day one / Day seven</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; width: 1080px; height: 1920px; overflow: hidden; background: #232326; }
+  canvas { display: block; width: 1080px; height: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1080" height="1920"></canvas>
+<script>
+'use strict';
+// Sand Magnet Totem — one tiny game, two builds.
+//   ?v=day1  — the first build: magnet, falling sand, a counter. Nothing else.
+//   ?v=day7  — after a week of daily updates: same map, same start, same seed —
+//              plus a pedestal to stack on, a 12-grain goal, a 60-second timer,
+//              3 lives, score, particles, clouds and a confetti win.
+// The map never moves and the spawn sequence is seeded, so day one and day seven
+// are the same game a week apart: the change is the whole story.
+
+const params = new URLSearchParams(location.search);
+const MODE = params.get('v') === 'day1' ? 'day1' : 'day7';
+const DAY7 = MODE === 'day7';
+
+const W = 1080, H = 1920;
+const GROUND_Y = 1880;
+const PED_X = 540;            // pedestal centre
+const PED_TOP = 1560;         // pedestal top
+const PED_W = 280;
+const GOAL = 12;
+const TIME_LIMIT = 60;
+const MAX_CARRY = 3;
+
+// Seeded RNG so both builds spawn the same grains in the same order.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(20261123);
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---- state ---------------------------------------------------------------
+const state = {
+  mode: MODE,
+  magnet: { x: 540, y: 1320 },
+  grains: [],          // {x, y, vy, sway, phase, caught, dropped, stackSlot}
+  carried: [],         // grain refs stuck to the magnet
+  stacked: 0,          // grains resting on the pedestal
+  stackRows: [],       // {x, y} resting positions, for drawing
+  score: 0,
+  caughtTotal: 0,      // day1 counter
+  lives: 3,
+  timeLeft: TIME_LIMIT,
+  won: false,
+  over: false,
+  spawnIn: 0.8,        // seconds until the next grain
+  elapsed: 0,
+  particles: [],       // {x, y, vx, vy, life, color, size}
+  popups: [],          // {x, y, text, life}
+  confetti: [],        // {x, y, vx, vy, color, size, rot, vr}
+  flash: 0,            // red flash on a miss (day7)
+  clouds: [],          // day7 only: {x, y, speed, scale}
+};
+
+if (DAY7) {
+  for (let i = 0; i < 5; i++) {
+    state.clouds.push({ x: rand() * W, y: 120 + rand() * 420, speed: 8 + rand() * 14, scale: 0.7 + rand() * 0.9 });
+  }
+}
+
+// ---- input ----------------------------------------------------------------
+function setPointer(x, y) {
+  state.magnet.x = Math.max(90, Math.min(W - 90, x));
+  state.magnet.y = Math.max(940, Math.min(1500, y));
+}
+canvas.addEventListener('pointermove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  setPointer((e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height));
+});
+canvas.addEventListener('pointerdown', (e) => {
+  const r = canvas.getBoundingClientRect();
+  setPointer((e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height));
+});
+
+// Exposed for the recording driver: the real game state, so the driver can
+// play with the mouse the way a person would.
+window.__totem = state;
+
+// ---- spawning -------------------------------------------------------------
+function spawnGrain() {
+  const x = 120 + rand() * (W - 240);
+  state.grains.push({
+    x, y: -40,
+    vy: DAY7 ? 360 : 420,
+    sway: 26 + rand() * 30,
+    phase: rand() * Math.PI * 2,
+    caught: false, dropped: false,
+  });
+}
+
+function stackPosition(n) {
+  // Grains pile on the pedestal in rows of 4, centred on PED_X.
+  const row = Math.floor(n / 4);
+  const col = n % 4;
+  const perRow = 4;
+  const x = PED_X + (col - (perRow - 1) / 2) * 56;
+  const y = PED_TOP - 26 - row * 50;
+  return { x, y };
+}
+
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand() * Math.PI * 2;
+    const v = speed * (0.4 + rand() * 0.8);
+    state.particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 60, life: 0.55 + rand() * 0.3, color, size: 5 + rand() * 7 });
+  }
+}
+
+function startConfetti() {
+  const colors = ['#ff2e88', '#ffd23f', '#2ec4ff', '#7dff5e', '#ff8a3d', '#ffffff'];
+  for (let i = 0; i < 220; i++) {
+    state.confetti.push({
+      x: rand() * W, y: -20 - rand() * 500,
+      vx: (rand() - 0.5) * 120, vy: 260 + rand() * 260,
+      color: colors[i % colors.length], size: 10 + rand() * 12,
+      rot: rand() * Math.PI, vr: (rand() - 0.5) * 9,
+    });
+  }
+}
+
+// ---- update ---------------------------------------------------------------
+function update(dt) {
+  if (state.over) { updateFx(dt); return; }
+  state.elapsed += dt;
+
+  if (DAY7) {
+    state.timeLeft -= dt;
+    if (state.timeLeft <= 0) { state.timeLeft = 0; state.over = true; }
+    for (const c of state.clouds) { c.x += c.speed * dt; if (c.x > W + 160) c.x = -160; }
+  }
+
+  // spawn
+  state.spawnIn -= dt;
+  if (state.spawnIn <= 0 && state.grains.length < 14) {
+    spawnGrain();
+    state.spawnIn = DAY7 ? 0.75 : 0.7;
+  }
+
+  const m = state.magnet;
+  for (const g of state.grains) {
+    if (g.caught || g.dropped) continue;
+    g.y += g.vy * dt;
+    g.x += Math.sin(state.elapsed * 2 + g.phase) * g.sway * dt;
+    // catch: grain touches the magnet
+    const dx = g.x - m.x, dy = g.y - m.y;
+    if (dx * dx + dy * dy < 125 * 125) {
+      g.caught = true;
+      if (DAY7) {
+        if (state.carried.length < MAX_CARRY) {
+          state.carried.push(g);
+          state.score += 10;
+          state.popups.push({ x: g.x, y: g.y - 30, text: '+10', life: 0.8 });
+          burst(g.x, g.y, '#ffd23f', 10, 220);
+        } else {
+          // magnet full: grain bounces off, keeps falling
+          g.caught = false; g.y += 30;
+        }
+      } else {
+        state.caughtTotal += 1;
+        burst(g.x, g.y, '#e8e0d0', 6, 140);
+      }
+      continue;
+    }
+    // miss: grain hits the ground
+    if (g.y >= GROUND_Y) {
+      g.dropped = true;
+      if (DAY7) {
+        state.lives -= 1;
+        state.flash = 0.35;
+        burst(g.x, GROUND_Y, '#ff5a5a', 14, 260);
+        if (state.lives <= 0) state.over = true;
+      }
+    }
+  }
+  state.grains = state.grains.filter((g) => !g.dropped && !(DAY7 && false));
+
+  if (DAY7) {
+    // carried grains ride under the magnet
+    state.carried.forEach((g, i) => {
+      g.x = m.x + (i - (state.carried.length - 1) / 2) * 56;
+      g.y = m.y + 78;
+    });
+    // drop onto the pedestal when the magnet hovers over it
+    if (Math.abs(m.x - PED_X) < 110 && m.y > 1380 && state.carried.length > 0) {
+      const g = state.carried.shift();
+      const pos = stackPosition(state.stacked);
+      g.x = pos.x; g.y = pos.y; g.dropped = true;
+      state.stackRows.push(pos);
+      state.stacked += 1;
+      state.score += 25;
+      state.popups.push({ x: pos.x, y: pos.y - 40, text: '+25', life: 0.8 });
+      burst(pos.x, pos.y, '#7dff5e', 12, 240);
+      if (state.stacked >= GOAL) {
+        state.won = true; state.over = true;
+        state.score += 100;
+        startConfetti();
+      }
+    }
+    // remove grains that were stacked (they live in stackRows now)
+    state.grains = state.grains.filter((g) => !g.dropped);
+  } else {
+    state.grains = state.grains.filter((g) => !g.caught);
+  }
+
+  updateFx(dt);
+}
+
+function updateFx(dt) {
+  for (const p of state.particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt; p.life -= dt; }
+  state.particles = state.particles.filter((p) => p.life > 0);
+  for (const p of state.popups) { p.y -= 60 * dt; p.life -= dt; }
+  state.popups = state.popups.filter((p) => p.life > 0);
+  for (const c of state.confetti) { c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt; }
+  state.confetti = state.confetti.filter((c) => c.y < H + 40);
+  if (state.flash > 0) state.flash -= dt;
+}
+
+// ---- drawing --------------------------------------------------------------
+function drawGrain(x, y, r) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = DAY7 ? '#e8a558' : '#b9a58c';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(x - 8, y - 9, r * 0.45, 0, Math.PI * 2);
+  ctx.fillStyle = DAY7 ? 'rgba(255,235,190,0.85)' : 'rgba(230,220,200,0.5)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.strokeStyle = DAY7 ? '#9c6a2e' : '#8a7a64';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawMagnet() {
+  const m = state.magnet;
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  // U magnet: two poles, red north / white south, steel body
+  ctx.lineWidth = 34;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(0, 0, 62, Math.PI, 0, false);
+  ctx.strokeStyle = DAY7 ? '#e8e8ec' : '#9a9aa0';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-62, 0); ctx.lineTo(-62, 62);
+  ctx.strokeStyle = DAY7 ? '#ff3b30' : '#8a8a90';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(62, 0); ctx.lineTo(62, 62);
+  ctx.strokeStyle = DAY7 ? '#f5f5f7' : '#8a8a90';
+  ctx.stroke();
+  ctx.fillStyle = DAY7 ? '#ff3b30' : '#8a8a90';
+  ctx.fillRect(-79, 52, 34, 22);
+  ctx.fillStyle = DAY7 ? '#f5f5f7' : '#8a8a90';
+  ctx.fillRect(45, 52, 34, 22);
+  ctx.restore();
+}
+
+function drawBackground() {
+  if (DAY7) {
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#7ec8f7');
+    sky.addColorStop(0.55, '#bfe6fb');
+    sky.addColorStop(1, '#ffe9b8');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
+    // sun
+    ctx.beginPath(); ctx.arc(880, 210, 86, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffd23f'; ctx.fill();
+    ctx.beginPath(); ctx.arc(880, 210, 104, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,210,63,0.45)'; ctx.lineWidth = 10; ctx.stroke();
+    // clouds
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    for (const c of state.clouds) {
+      ctx.beginPath();
+      ctx.ellipse(c.x, c.y, 120 * c.scale, 42 * c.scale, 0, 0, Math.PI * 2);
+      ctx.ellipse(c.x + 70 * c.scale, c.y + 12 * c.scale, 80 * c.scale, 34 * c.scale, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // ground
+    ctx.fillStyle = '#8fce6e'; ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    ctx.fillStyle = '#7cbf5e'; ctx.fillRect(0, GROUND_Y, W, 14);
+  } else {
+    ctx.fillStyle = '#232326';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#2e2e33';
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+  }
+}
+
+function drawPedestal() {
+  if (DAY7) {
+    // decorated totem pedestal
+    ctx.fillStyle = '#5a4632';
+    ctx.fillRect(PED_X - PED_W / 2, PED_TOP, PED_W, H - PED_TOP);
+    ctx.fillStyle = '#6e5844';
+    ctx.fillRect(PED_X - PED_W / 2, PED_TOP, PED_W, 26);
+    ctx.fillStyle = '#ffd23f';
+    ctx.fillRect(PED_X - PED_W / 2 - 16, PED_TOP - 18, PED_W + 32, 22);
+    ctx.fillStyle = '#ff2e88';
+    for (let i = 0; i < 5; i++) {
+      ctx.beginPath();
+      ctx.arc(PED_X - PED_W / 2 + 34 + i * 56, PED_TOP + 90, 12, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#3d2f22';
+    ctx.font = 'bold 44px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('TOTEM', PED_X, PED_TOP + 190);
+  } else {
+    // the same pedestal, unfinished: a flat grey slab
+    ctx.fillStyle = '#3a3a3f';
+    ctx.fillRect(PED_X - PED_W / 2, PED_TOP, PED_W, H - PED_TOP);
+  }
+}
+
+function drawHud() {
+  ctx.textAlign = 'left';
+  if (DAY7) {
+    ctx.fillStyle = 'rgba(20,24,40,0.55)';
+    ctx.fillRect(0, 0, W, 210);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 58px Inter, sans-serif';
+    ctx.fillText('SCORE ' + state.score, 48, 92);
+    ctx.font = '800 44px Inter, sans-serif';
+    ctx.fillText('STACK ' + state.stacked + '/' + GOAL, 48, 158);
+    ctx.textAlign = 'center';
+    ctx.font = '800 76px Inter, sans-serif';
+    ctx.fillStyle = state.timeLeft <= 10 ? '#ff5a5a' : '#ffffff';
+    ctx.fillText(Math.ceil(state.timeLeft) + 's', W / 2, 108);
+    ctx.textAlign = 'right';
+    ctx.font = '800 58px Inter, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('♥'.repeat(Math.max(0, state.lives)) + '♡'.repeat(Math.max(0, 3 - state.lives)), W - 48, 92);
+    ctx.font = '800 40px Inter, sans-serif';
+    ctx.fillStyle = '#ffe9b8';
+    ctx.fillText('CARRY ' + state.carried.length + '/3', W - 48, 158);
+  } else {
+    ctx.fillStyle = '#cfcfd4';
+    ctx.font = '700 52px monospace';
+    ctx.fillText('GRAINS ' + state.caughtTotal, 48, 96);
+  }
+}
+
+function draw() {
+  drawBackground();
+  drawPedestal();
+  // stacked grains
+  for (const p of state.stackRows) drawGrain(p.x, p.y, 26);
+  // falling grains
+  for (const g of state.grains) {
+    if (g.caught && !DAY7) continue;
+    drawGrain(g.x, g.y, 26);
+  }
+  drawMagnet();
+  // particles + popups
+  for (const p of state.particles) {
+    ctx.globalAlpha = Math.max(0, p.life * 1.8);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+  for (const p of state.popups) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 46px Inter, sans-serif';
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+  drawHud();
+  // win / game-over banner (day7)
+  if (state.over && DAY7) {
+    ctx.fillStyle = 'rgba(20,16,40,0.45)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    if (state.won) {
+      for (const c of state.confetti) {
+        ctx.save();
+        ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+        ctx.fillStyle = c.color;
+        ctx.fillRect(-c.size / 2, -c.size / 4, c.size, c.size / 2);
+        ctx.restore();
+      }
+      ctx.fillStyle = '#ffd23f';
+      ctx.font = '900 110px Inter, sans-serif';
+      ctx.fillText('TOTEM', W / 2, 760);
+      ctx.fillText('COMPLETE!', W / 2, 890);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 56px Inter, sans-serif';
+      ctx.fillText('12 grains stacked in ' + Math.ceil(state.elapsed) + 's', W / 2, 990);
+      ctx.fillText('SCORE ' + state.score, W / 2, 1070);
+    } else {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 100px Inter, sans-serif';
+      ctx.fillText(state.timeLeft <= 0 ? "TIME'S UP" : 'OUT OF LIVES', W / 2, 820);
+      ctx.font = '800 56px Inter, sans-serif';
+      ctx.fillText('STACKED ' + state.stacked + '/' + GOAL + '  ·  SCORE ' + state.score, W / 2, 920);
+    }
+  }
+  if (state.flash > 0) {
+    ctx.fillStyle = 'rgba(255,60,60,' + (state.flash * 0.9) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// ---- main loop ------------------------------------------------------------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
